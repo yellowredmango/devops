@@ -1,0 +1,227 @@
+---
+pool:
+  vmImage: ubuntu-latest
+variables:
+  SONAR_PROJECT_KEY: Your-Projec-Name
+  SONAR_PROJECT_NAME: Your-Projec-Name
+  SONAR_PROJECT_VERSION: "1.0"
+  SONARQUBE_PORT: "9000"
+  SONARQUBE_URL: http://localhost:9000
+  SONARQUBE_CONTAINER_NAME: sonarqube-temp
+  Username: admin
+  OldPassword: admin
+  Password: 1233_abcDEFG_S123
+  Credentials: ${{variables.Username}}:${{variables.Password}}
+jobs:
+  - job: SonarScanJob
+    steps:
+      - script: >
+          echo "🔧 Starting SonarQube in Docker..."
+
+          docker run -d --name $SONARQUBE_CONTAINER_NAME \
+            -p $SONARQUBE_PORT:9000 \
+            sonarqube:latest
+
+          echo "⏳ Waiting for SonarQube to be ready..."
+
+          for i in {1..30}; do
+            curl -s $SONARQUBE_URL/api/system/health | grep '"status":"UP"' && break
+            echo "Waiting... ($i)"
+            sleep 10
+          done
+        displayName: Start SonarQube Container
+      - script: >
+          echo "⬇️ Installing SonarScanner CLI..."
+
+          curl -sSLo sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+
+          unzip -q sonar-scanner.zip -d $HOME/sonar-scanner
+
+          echo "##vso[task.prependpath]$HOME/sonar-scanner/sonar-scanner-5.0.1.3006-linux/bin"
+        displayName: Install SonarScanner CLI
+      - script: >
+          echo "Resetting default sonar password"
+
+          curl -s -X POST -u "admin:admin" \
+            -d "login=${{variables.Username}}&previousPassword=${{variables.OldPassword}}&password=${{variables.Password}}" \
+            "$SONARQUBE_URL/api/users/change_password"
+
+          echo "Creating default project and set default fav ..."
+
+          curl -s -u "${{variables.Credentials}}" -X POST "$SONARQUBE_URL/api/projects/create?name=$SONAR_PROJECT_NAME&project=$SONAR_PROJECT_KEY" | jq
+
+          curl -s -u "${{variables.Credentials}}" -X POST "$SONARQUBE_URL/api/users/set_homepage?type=PROJECT&component=$SONAR_PROJECT_NAME"
+
+
+          echo "Creating token and scan using internal-ip because of docker to docker communication"
+
+          curl -s -X POST -u "${{variables.Credentials}}" "$SONARQUBE_URL/api/user_tokens/generate?name=$(date +%s%N)"
+
+          SONAR_TOKEN=$(curl -s -X POST -u "${{variables.Credentials}}" "$SONARQUBE_URL/api/user_tokens/generate?name=$(date +%s%N)" | jq -r .token)
+
+          echo "SONAR_TOKEN=$SONAR_TOKEN"
+
+
+
+          echo "🔍 Running SonarQube Scan..."
+
+          sonar-scanner \
+            -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+            -Dsonar.projectName=$SONAR_PROJECT_NAME \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=$SONARQUBE_URL \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.projectVersion=$SONAR_PROJECT_VERSION \
+            -Dsonar.sourceEncoding=UTF-8 \
+            -Dsonar.php.exclusions=**/vendor/**
+        displayName: Run SonarQube Scanner
+      - script: |
+          set -e
+          echo "📊 Checking Quality Gate status..."
+
+          REPORT_TASK_FILE=".scannerwork/report-task.txt"
+          if [[ ! -f "$REPORT_TASK_FILE" ]]; then
+            echo "❌ Report file not found: $REPORT_TASK_FILE"
+            exit 1
+          fi
+
+          TASK_ID=$(grep "ceTaskId" $REPORT_TASK_FILE | cut -d'=' -f2)
+          if [[ -z "$TASK_ID" ]]; then
+            echo "❌ ceTaskId not found in report-task.txt"
+            cat $REPORT_TASK_FILE
+            exit 1
+          fi
+          echo "🆔 CE Task ID: $TASK_ID"
+
+          ANALYSIS_ID=""
+          echo "⏳ Waiting for analysis to complete..."
+          for i in {1..30}; do
+            echo "🔁 Poll attempt $i"
+            API_RESPONSE=$(curl -s -u "${{variables.Credentials}}" -w "\nHTTP_STATUS:%{http_code}" "$SONARQUBE_URL/api/ce/task?id=$TASK_ID")
+            BODY=$(echo "$API_RESPONSE" | sed -e '/HTTP_STATUS:/d')
+            STATUS_CODE=$(echo "$API_RESPONSE" | grep 'HTTP_STATUS' | cut -d':' -f2)
+
+            if [[ "$STATUS_CODE" != "200" ]]; then
+              echo "❌ API returned non-200 status: $STATUS_CODE"
+              exit 1
+            fi
+
+            STATUS=$(echo "$BODY" | jq -r '.task.status')
+
+            if [[ "$STATUS" == "SUCCESS" ]]; then
+              echo "✅ CE Task completed"
+              ANALYSIS_ID=$(echo "$BODY" | jq -r '.task.analysisId')
+              break
+            elif [[ "$STATUS" == "FAILED" ]]; then
+              echo "❌ CE task failed"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [[ -z "$ANALYSIS_ID" ]]; then
+            echo "❌ Analysis ID not found in CE task response"
+            exit 1
+          fi
+
+          echo "🔎 Getting Quality Gate details..."
+          QG_RESPONSE=$(curl -s -u "${{variables.Credentials}}" "$SONARQUBE_URL/api/qualitygates/project_status?analysisId=$ANALYSIS_ID")
+          QG_STATUS=$(echo "$QG_RESPONSE" | jq -r '.projectStatus.status')
+
+          echo "📥 Fetching project measures..."
+          METRICS="ncloc,coverage,bugs,vulnerabilities,code_smells,duplicated_lines_density,sqale_rating,reliability_rating,security_rating"
+          MEASURE_RESPONSE=$(curl -s -u "${{variables.Credentials}}" "$SONARQUBE_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=$METRICS")
+
+          echo "✅ Quality Gate Status: $QG_STATUS"
+
+          echo "##vso[task.setvariable variable=QUALITY_GATE_STATUS]$QG_STATUS"
+
+          SUMMARY_FILE="$(Pipeline.Workspace)/sonar-summary.md"
+          echo "### SonarQube Quality Gate Summary" > $SUMMARY_FILE
+          echo "**Status:** $QG_STATUS" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+          echo "#### Conditions:" >> $SUMMARY_FILE
+          echo '| Metric | Status | Actual | Error Threshold | Comparator |' >> $SUMMARY_FILE
+          echo '|--------|--------|--------|------------------|------------|' >> $SUMMARY_FILE
+          echo "$QG_RESPONSE" | jq -r '.projectStatus.conditions[] | "| \(.metricKey) | \(.status) | \(.actualValue // "N/A") | \(.errorThreshold // "N/A") | \(.comparator // "N/A") |"' >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+
+          echo "#### Key Metrics:" >> $SUMMARY_FILE
+          echo '| Metric | Value |' >> $SUMMARY_FILE
+          echo '|--------|-------|' >> $SUMMARY_FILE
+          echo "$MEASURE_RESPONSE" | jq -r '.component.measures[] | "| \(.metric) | \(.value) |"' >> $SUMMARY_FILE
+
+          echo "" >> $SUMMARY_FILE
+          echo '---' >> $SUMMARY_FILE
+          echo "#### Raw API Responses" >> $SUMMARY_FILE
+          echo '```json' >> $SUMMARY_FILE
+          echo "$QG_RESPONSE" | jq '.' >> $SUMMARY_FILE
+          echo '```' >> $SUMMARY_FILE
+
+          # echo "##vso[task.uploadsummary]$SUMMARY_FILE"
+
+          if [[ "$QG_STATUS" != "OK" ]]; then
+            echo "##vso[task.logissue type=error]Quality Gate failed!"
+            echo "##vso[task.complete result=Failed;]Quality Gate Failed: $QG_STATUS"
+            exit 1
+          else
+            echo "##vso[task.complete result=Succeeded;]Quality Gate Passed: $QG_STATUS"
+          fi
+        displayName: 'Check Quality Gate Status and Report'
+        
+      - script: |
+          echo "📸 Installing Puppeteer and capturing screenshot..."
+
+          # Install Node and Puppeteer
+          sudo apt-get update
+          sudo apt-get install -y nodejs npm
+          npm install puppeteer
+
+          # Create screenshot script
+          cat <<EOF > capture.js
+          const puppeteer = require('puppeteer');
+
+          (async () => {
+            const browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+            const page = await browser.newPage();
+
+            // Go to login page
+            await page.goto('${{ variables.SONARQUBE_URL }}/sessions/new', { waitUntil: 'networkidle0' });
+
+            // Login using updated selectors
+            await page.type('input[name="login"]', '${{ variables.Username }}');
+            await page.type('input[name="password"]', '${{ variables.Password }}');
+            await Promise.all([
+              page.click('button[type="submit"]'),
+              page.waitForNavigation({ waitUntil: 'networkidle0' }),
+            ]);
+
+            // Visit project dashboard
+            await page.goto('${{ variables.SONARQUBE_URL }}/dashboard?id=${{ variables.SONAR_PROJECT_KEY }}', { waitUntil: 'networkidle0' });
+
+            // Capture full page screenshot
+            await page.screenshot({ path: 'sonarqube-dashboard.png', fullPage: true });
+
+            await browser.close();
+          })();
+          EOF
+
+          # Run screenshot script
+          node capture.js
+        displayName: 'Capture SonarQube Dashboard Screenshot'
+
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: 'sonarqube-dashboard.png'
+          ArtifactName: 'SonarDashboard'
+          publishLocation: 'Container'
+        displayName: 'Upload SonarQube UI Screenshot'
+
+      - script: |
+          echo "📎 Updating summary to include screenshot..."
+          SUMMARY_FILE="$(Pipeline.Workspace)/sonar-summary.md"
+          echo "#### Dashboard UI Screenshot" >> $SUMMARY_FILE
+          echo "![SonarQube Dashboard](../artifacts/SonarDashboard/sonarqube-dashboard.png)" >> $SUMMARY_FILE
+          echo "##vso[task.uploadsummary]$SUMMARY_FILE"
+        displayName: 'Attach Screenshot to Summary'
